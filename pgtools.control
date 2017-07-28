@@ -1,0 +1,5 @@
+default_version = '1.0.0'
+comment = 'pgtools for pgdba'
+requires = 'pg_stat_statements, pg_buffercache'
+module_pathname = '$libdir/pgtools'
+relocatable = false
