@@ -1,258 +1,6 @@
 CREATE SCHEMA IF NOT EXISTS pgtools;
 SET search_path = pgtools, public;
 
-CREATE OR REPLACE VIEW backend_queries AS (
-SELECT pg_stat_get_backend_pid(s.backendid) AS pid,
-    pg_stat_get_backend_client_addr(s.backendid) AS client_addr,
-    pg_stat_get_backend_client_port(s.backendid) AS client_port,
-    pg_stat_get_backend_start(s.backendid) AS session_start_time,
-    pg_stat_get_backend_xact_start(s.backendid) AS transaction_start_time,
-    now() - pg_stat_get_backend_xact_start(s.backendid) AS transaction_time,
-    pg_stat_get_backend_waiting(s.backendid) AS is_waiting,
-    regexp_replace(pg_stat_get_backend_activity(s.backendid), E'[\n\r\t ]+', ' ', 'ig') AS query
-FROM ( SELECT pg_stat_get_backend_idset() AS backendid) s
-WHERE regexp_replace(pg_stat_get_backend_activity(s.backendid), E'[\n\r\t ]+', ' ', 'ig') <> ALL (ARRAY['select 1'::text, 'SELECT $1;'::text, 'BEGIN'::text, 'COMMIT'::text, 'ROLLBACK'::text, 'DISCARD ALL;'::text, 'DEALLOCATE ALL;'::text, 'SHOW TRANSACTION ISOLATION LEVEL'::text, 'SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE'::text])
-ORDER BY transaction_time DESC
-);
-CREATE SCHEMA IF NOT EXISTS pgtools;
-SET search_path = pgtools, public;
-
--- btree index stats query
--- estimates bloat for btree indexes
-CREATE OR REPLACE VIEW bloat_indexes AS (
-WITH btree_index_atts AS (
-    SELECT nspname, 
-        indexclass.relname as index_name, 
-        indexclass.reltuples, 
-        indexclass.relpages, 
-        indrelid, indexrelid,
-        indexclass.relam,
-        tableclass.relname as tablename,
-        regexp_split_to_table(indkey::text, ' ')::smallint AS attnum,
-        indexrelid as index_oid
-    FROM pg_index
-    JOIN pg_class AS indexclass ON pg_index.indexrelid = indexclass.oid
-    JOIN pg_class AS tableclass ON pg_index.indrelid = tableclass.oid
-    JOIN pg_namespace ON pg_namespace.oid = indexclass.relnamespace
-    JOIN pg_am ON indexclass.relam = pg_am.oid
-    WHERE pg_am.amname = 'btree' and indexclass.relpages > 0
-         --AND nspname NOT IN ('pg_catalog','information_schema')
-    ),
-index_item_sizes AS (
-    SELECT
-    ind_atts.nspname, ind_atts.index_name, 
-    ind_atts.reltuples, ind_atts.relpages, ind_atts.relam,
-    indrelid AS table_oid, index_oid,
-    current_setting('block_size')::numeric AS bs,
-    8 AS maxalign,
-    24 AS pagehdr,
-    CASE WHEN max(coalesce(pg_stats.null_frac,0)) = 0
-        THEN 2
-        ELSE 6
-    END AS index_tuple_hdr,
-    sum( (1-coalesce(pg_stats.null_frac, 0)) * coalesce(pg_stats.avg_width, 1024) ) AS nulldatawidth
-    FROM pg_attribute
-    JOIN btree_index_atts AS ind_atts ON pg_attribute.attrelid = ind_atts.indexrelid -- AND pg_attribute.attnum = ind_atts.attnum
-    JOIN pg_stats ON pg_stats.schemaname = ind_atts.nspname
-          -- stats for regular index columns
-          AND ( (pg_stats.tablename = ind_atts.tablename AND pg_stats.attname = pg_catalog.pg_get_indexdef(pg_attribute.attrelid, pg_attribute.attnum, TRUE)) 
-          -- stats for functional indexes
-          OR   (pg_stats.tablename = ind_atts.index_name AND pg_stats.attname = pg_attribute.attname))
-    WHERE pg_attribute.attnum > 0
-    GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9
-),
-index_aligned_est AS (
-    SELECT maxalign, bs, nspname, index_name, reltuples,
-        relpages, relam, table_oid, index_oid,
-        coalesce (
-            ceil (
-                reltuples * ( 6 
-                    + maxalign 
-                    - CASE
-                        WHEN index_tuple_hdr%maxalign = 0 THEN maxalign
-                        ELSE index_tuple_hdr%maxalign
-                      END
-                    + nulldatawidth 
-                    + maxalign 
-                    - CASE /* Add padding to the data to align on MAXALIGN */
-                        WHEN nulldatawidth::integer%maxalign = 0 THEN maxalign
-                        ELSE nulldatawidth::integer%maxalign
-                      END
-                )::numeric 
-              / ( bs - pagehdr::NUMERIC )
-              +1 )
-         , 0 )
-      as expected
-    FROM index_item_sizes
-),
-raw_bloat AS (
-    SELECT current_database() as dbname, nspname, pg_class.relname AS table_name, index_name,
-        bs*(index_aligned_est.relpages)::bigint AS totalbytes, expected,
-        CASE
-            WHEN index_aligned_est.relpages <= expected 
-                THEN 0
-                ELSE bs*(index_aligned_est.relpages-expected)::bigint 
-            END AS wastedbytes,
-        CASE
-            WHEN index_aligned_est.relpages <= expected
-                THEN 0 
-                ELSE bs*(index_aligned_est.relpages-expected)::bigint * 100 / (bs*(index_aligned_est.relpages)::bigint) 
-            END AS realbloat,
-        pg_relation_size(index_aligned_est.table_oid) as table_bytes,
-        stat.idx_scan as index_scans
-    FROM index_aligned_est
-    JOIN pg_class ON pg_class.oid=index_aligned_est.table_oid
-    JOIN pg_stat_user_indexes AS stat ON index_aligned_est.index_oid = stat.indexrelid
-),
-format_bloat AS (
-SELECT dbname as database_name, nspname as schema_name, table_name, index_name,
-        round(realbloat) as bloat_pct, round(wastedbytes/(1024^2)::NUMERIC) as bloat_mb,
-        round(totalbytes/(1024^2)::NUMERIC,3) as index_mb,
-        round(table_bytes/(1024^2)::NUMERIC,3) as table_mb,
-        index_scans
-FROM raw_bloat
-)
--- final query outputting the bloated indexes
-SELECT database_name, schema_name, table_name, index_name, index_scans, bloat_pct, bloat_mb, index_mb, table_mb
-FROM format_bloat
-ORDER BY bloat_mb, bloat_pct DESC 
-);
-CREATE SCHEMA IF NOT EXISTS pgtools;
-SET search_path = pgtools, public;
-
--- new table bloat query
--- still needs work; is often off by +/- 20%
-CREATE OR REPLACE VIEW bloat_tables AS (
-WITH constants AS (
-    SELECT current_setting('block_size')::numeric AS bs, 23 AS hdr, 8 AS ma
-),
-no_stats AS (
-    SELECT table_schema, table_name, 
-        n_live_tup::numeric as est_rows,
-        pg_table_size(relid)::numeric as table_size
-    FROM information_schema.columns
-        JOIN pg_stat_user_tables as psut
-           ON table_schema = psut.schemaname
-           AND table_name = psut.relname
-        LEFT OUTER JOIN pg_stats
-        ON table_schema = pg_stats.schemaname
-            AND table_name = pg_stats.tablename
-            AND column_name = attname 
-    WHERE attname IS NULL
-        AND table_schema NOT IN ('pg_catalog', 'information_schema')
-    GROUP BY table_schema, table_name, relid, n_live_tup
-),
-null_headers AS (
-    -- calculate null header sizes
-    -- omitting tables which dont have complete stats
-    -- and attributes which aren't visible
-    SELECT
-        hdr+1+(sum(CASE WHEN null_frac <> 0 THEN 1 else 0 END)/8) as nullhdr,
-        SUM((1-null_frac)*avg_width) as datawidth,
-        MAX(null_frac) as maxfracsum,
-        schemaname,
-        tablename,
-        hdr, ma, bs
-    FROM pg_stats CROSS JOIN constants
-        LEFT OUTER JOIN no_stats
-            ON schemaname = no_stats.table_schema
-            AND tablename = no_stats.table_name
-    WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
-        AND no_stats.table_name IS NULL
-        AND EXISTS ( SELECT 1
-            FROM information_schema.columns
-                WHERE schemaname = columns.table_schema
-                    AND tablename = columns.table_name )
-    GROUP BY schemaname, tablename, hdr, ma, bs
-),
-data_headers AS (
-    -- estimate header and row size
-    SELECT
-        ma, bs, hdr, schemaname, tablename,
-        (datawidth+(hdr+ma-(CASE WHEN hdr%ma=0 THEN ma ELSE hdr%ma END)))::numeric AS datahdr,
-        (maxfracsum*(nullhdr+ma-(CASE WHEN nullhdr%ma=0 THEN ma ELSE nullhdr%ma END))) AS nullhdr2
-    FROM null_headers
-),
-table_estimates AS (
-    -- make estimates of how large the table should be
-    -- based on row and page size
-    SELECT schemaname, tablename, bs,
-        reltuples::numeric as est_rows, relpages * bs as table_bytes,
-    CEIL((reltuples*
-            (datahdr + nullhdr2 + 4 + ma -
-                (CASE WHEN datahdr%ma=0
-                    THEN ma ELSE datahdr%ma END)
-                )/(bs-20))) * bs AS expected_bytes,
-        reltoastrelid
-    FROM data_headers
-        JOIN pg_class ON tablename = relname
-        JOIN pg_namespace ON relnamespace = pg_namespace.oid
-            AND schemaname = nspname
-    WHERE pg_class.relkind = 'r'
-),
-estimates_with_toast AS (
-    -- add in estimated TOAST table sizes
-    -- estimate based on 4 toast tuples per page because we dont have 
-    -- anything better.  also append the no_data tables
-    SELECT schemaname, tablename, 
-        TRUE as can_estimate,
-        est_rows,
-        table_bytes + ( coalesce(toast.relpages, 0) * bs ) as table_bytes,
-        expected_bytes + ( ceil( coalesce(toast.reltuples, 0) / 4 ) * bs ) as expected_bytes
-    FROM table_estimates LEFT OUTER JOIN pg_class as toast
-        ON table_estimates.reltoastrelid = toast.oid
-            AND toast.relkind = 't'
-),
-table_estimates_plus AS (
--- add some extra metadata to the table data
--- and calculations to be reused
--- including whether we cant estimate it
--- or whether we think it might be compressed
-    SELECT current_database() as databasename,
-            schemaname, tablename, can_estimate, 
-            est_rows,
-            CASE
-                WHEN table_bytes > 0
-                THEN table_bytes::NUMERIC
-                ELSE NULL::NUMERIC 
-            END AS table_bytes,
-            CASE
-                WHEN expected_bytes > 0 
-                THEN expected_bytes::NUMERIC
-                ELSE NULL::NUMERIC 
-            END AS expected_bytes,
-            CASE
-                WHEN expected_bytes > 0 AND table_bytes > 0
-                    AND expected_bytes <= table_bytes
-                THEN (table_bytes - expected_bytes)::NUMERIC
-                ELSE 0::NUMERIC
-            END AS bloat_bytes
-    FROM estimates_with_toast
-    UNION ALL
-    SELECT current_database() as databasename, 
-        table_schema, table_name, FALSE, 
-        est_rows, table_size,
-        NULL::NUMERIC, NULL::NUMERIC
-    FROM no_stats
-),
-bloat_data AS (
-    -- do final math calculations and formatting
-    select current_database() as database_name,
-        schemaname as schema_name, tablename as table_name, can_estimate, 
-        table_bytes, round(table_bytes/(1024^2)::NUMERIC,3) as table_mb,
-        expected_bytes, round(expected_bytes/(1024^2)::NUMERIC,3) as expected_mb,
-        round(bloat_bytes*100/table_bytes) as bloat_pct,
-        round(bloat_bytes/(1024::NUMERIC^2),2) as bloat_mb,
-        est_rows
-    FROM table_estimates_plus
-)
-SELECT database_name, schema_name, table_name, bloat_pct, bloat_mb, table_mb, can_estimate, est_rows
-FROM bloat_data
-ORDER BY bloat_mb, bloat_pct DESC
-);
-CREATE SCHEMA IF NOT EXISTS pgtools;
-SET search_path = pgtools, public;
-
 CREATE OR REPLACE VIEW buffer_stats AS (
 SELECT c.relname,
     pg_size_pretty(count(*) * current_setting('block_size')::bigint) AS buffered,
@@ -269,275 +17,6 @@ ON (b.reldatabase = d.oid AND d.datname = current_database())
 GROUP BY c.oid,c.relname
 ORDER BY 3 DESC
 );
-CREATE SCHEMA IF NOT EXISTS pgtools;
-SET search_path = pgtools, public;
-
-CREATE OR REPLACE VIEW duplicate_indexes_fuzzy AS (
-WITH index_cols_ord as (
-    SELECT attrelid, attnum, attname
-    FROM pg_attribute
-        JOIN pg_index ON indexrelid = attrelid
-    WHERE indkey[0] > 0
-    ORDER BY attrelid, attnum
-),
-index_col_list AS (
-    SELECT attrelid,
-        array_agg(attname) as cols
-    FROM index_cols_ord
-    GROUP BY attrelid
-),
-dup_natts AS (
-SELECT indrelid, indexrelid
-FROM pg_index as ind
-WHERE EXISTS ( SELECT 1
-    FROM pg_index as ind2
-    WHERE ind.indrelid = ind2.indrelid
-    AND ( ind.indkey @> ind2.indkey
-     OR ind.indkey <@ ind2.indkey )
-    AND ind.indkey[0] = ind2.indkey[0]
-    AND ind.indkey <> ind2.indkey
-    AND ind.indexrelid <> ind2.indexrelid
-) )
-SELECT userdex.schemaname as schema_name,
-    userdex.relname as table_name,
-    userdex.indexrelname as index_name,
-    array_to_string(cols, ', ') as index_cols,
-    indexdef,
-    idx_scan as index_scans
-FROM pg_stat_user_indexes as userdex
-    JOIN index_col_list ON index_col_list.attrelid = userdex.indexrelid
-    JOIN dup_natts ON userdex.indexrelid = dup_natts.indexrelid
-    JOIN pg_indexes ON userdex.schemaname = pg_indexes.schemaname
-        AND userdex.indexrelname = pg_indexes.indexname
-ORDER BY userdex.schemaname, userdex.relname, cols, userdex.indexrelname
-);
-CREATE SCHEMA IF NOT EXISTS pgtools;
-SET search_path = pgtools, public;
-
-CREATE OR REPLACE VIEW fk_no_index AS (
-WITH fk_actions ( code, action ) AS (
-    VALUES ( 'a', 'error' ),
-        ( 'r', 'restrict' ),
-        ( 'c', 'cascade' ),
-        ( 'n', 'set null' ),
-        ( 'd', 'set default' )
-),
-fk_list AS (
-    SELECT pg_constraint.oid as fkoid, conrelid, confrelid as parentid,
-        conname, relname, nspname,
-        fk_actions_update.action as update_action,
-        fk_actions_delete.action as delete_action,
-        conkey as key_cols
-    FROM pg_constraint
-        JOIN pg_class ON conrelid = pg_class.oid
-        JOIN pg_namespace ON pg_class.relnamespace = pg_namespace.oid
-        JOIN fk_actions AS fk_actions_update ON confupdtype = fk_actions_update.code
-        JOIN fk_actions AS fk_actions_delete ON confdeltype = fk_actions_delete.code
-    WHERE contype = 'f'
-),
-fk_attributes AS (
-    SELECT fkoid, conrelid, attname, attnum
-    FROM fk_list
-        JOIN pg_attribute
-            ON conrelid = attrelid
-            AND attnum = ANY( key_cols )
-    ORDER BY fkoid, attnum
-),
-fk_cols_list AS (
-    SELECT fkoid, array_agg(attname) as cols_list
-    FROM fk_attributes
-    GROUP BY fkoid
-),
-index_list AS (
-    SELECT indexrelid as indexid,
-        pg_class.relname as indexname,
-        indrelid,
-        indkey,
-        indpred is not null as has_predicate,
-        pg_get_indexdef(indexrelid) as indexdef
-    FROM pg_index
-        JOIN pg_class ON indexrelid = pg_class.oid
-    WHERE indisvalid
-),
-fk_index_match AS (
-    SELECT fk_list.*,
-        indexid,
-        indexname,
-        indkey::int[] as indexatts,
-        has_predicate,
-        indexdef,
-        array_length(key_cols, 1) as fk_colcount,
-        array_length(indkey,1) as index_colcount,
-        round(pg_relation_size(conrelid)/(1024^2)::numeric) as table_mb,
-        cols_list
-    FROM fk_list
-        JOIN fk_cols_list USING (fkoid)
-        LEFT OUTER JOIN index_list
-            ON conrelid = indrelid
-            AND (indkey::int2[])[0:(array_length(key_cols,1) -1)] @> key_cols
-
-),
-fk_perfect_match AS (
-    SELECT fkoid
-    FROM fk_index_match
-    WHERE (index_colcount - 1) <= fk_colcount
-        AND NOT has_predicate
-        AND indexdef LIKE '%USING btree%'
-),
-fk_index_check AS (
-    SELECT 'no index' as issue, *, 1 as issue_sort
-    FROM fk_index_match
-    WHERE indexid IS NULL
-    UNION ALL
-    SELECT 'questionable index' as issue, *, 2
-    FROM fk_index_match
-    WHERE indexid IS NOT NULL
-        AND fkoid NOT IN (
-            SELECT fkoid
-            FROM fk_perfect_match)
-),
-parent_table_stats AS (
-    SELECT fkoid, tabstats.relname as parent_name,
-        (n_tup_ins + n_tup_upd + n_tup_del + n_tup_hot_upd) as parent_writes,
-        round(pg_relation_size(parentid)/(1024^2)::numeric) as parent_mb
-    FROM pg_stat_user_tables AS tabstats
-        JOIN fk_list
-            ON relid = parentid
-),
-fk_table_stats AS (
-    SELECT fkoid,
-        (n_tup_ins + n_tup_upd + n_tup_del + n_tup_hot_upd) as writes,
-        seq_scan as table_scans
-    FROM pg_stat_user_tables AS tabstats
-        JOIN fk_list
-            ON relid = conrelid
-)
-SELECT nspname as schema_name,
-    relname as table_name,
-    conname as fk_name,
-    issue,
-    table_mb,
-    writes,
-    table_scans,
-    parent_name,
-    parent_mb,
-    parent_writes,
-    cols_list,
-    indexdef
-FROM fk_index_check
-    JOIN parent_table_stats USING (fkoid)
-    JOIN fk_table_stats USING (fkoid)
-WHERE table_mb > 9
-    AND ( writes > 1000
-        OR parent_writes > 1000
-        OR parent_mb > 10 )
-ORDER BY issue_sort, table_mb DESC, table_name, fk_name
-);
-CREATE SCHEMA IF NOT EXISTS pgtools;
-SET search_path = pgtools, public;
-
-CREATE OR REPLACE VIEW function_stats AS (
-WITH total AS (
-    SELECT SUM(total_time)::BIGINT AS total_agg
-    FROM pg_stat_user_functions
-)
-SELECT
-    schemaname AS schema_name,
-    funcname AS function_name,
-    SUM(calls) AS calls,
-    SUM(total_time)::BIGINT AS total_time,
-    SUM(self_time)::BIGINT AS self_call_time,
-    SUM(total_time)/SUM(calls) AS avg_time,
-    100*SUM(total_time)/(SELECT total_agg FROM total) AS pct_functions
-FROM pg_stat_user_functions
-GROUP BY schema_name, function_name
-ORDER BY total_time DESC
-);
-CREATE SCHEMA IF NOT EXISTS pgtools;
-SET search_path = pgtools, public;
-
-CREATE OR REPLACE VIEW lock_check AS (
-SELECT
-	wait.pid,
-	wait.query as q,
-	wait.locktype,
-	granted.pid as waitfor_pid,
-	granted.relation,
-	granted.datname || '.' || d.nspname || '.' || c.relname as name,
-	granted.transactionid,
-	granted.virtualxid,
-	granted.usename,
-	granted.client_addr,
-	granted.query
-FROM
-	(SELECT
-		a.query,
-		b.pid,
-		b.relation,
-		b.transactionid,
-		b.page,
-		b.tuple,
-		b.locktype,
-		b.virtualxid
-	FROM
-		pg_stat_activity a,
-		pg_locks b
-	WHERE
-		a.waiting = 't'
-		AND a.pid = b.pid
-		AND granted = 'f'
-) wait
-INNER JOIN
-	(SELECT
-		b.pid,
-		b.usename,
-		b.client_addr,
-		b.backend_start,
-		b.query_start,
-		b.waiting,
-		b.query,
-		b.datname,
-		a.relation,
-		a.transactionid,
-		a.page,
-		a.tuple,
-		a.locktype,
-		a.virtualxid
-	FROM
-		pg_locks a,
-		pg_stat_activity b
-	WHERE
-		a.pid = b.pid
-		AND a.granted = 't'
-	) granted
-ON (
-	( wait.locktype = 'transactionid'
-	AND granted.locktype = 'transactionid'
-	AND wait.transactionid = granted.transactionid )
-	OR
-	( wait.locktype = 'relation'
-	AND granted.locktype = 'relation'
-	AND wait.relation = granted.relation
-	)
-	OR
-	( wait.locktype = 'virtualxid'
-	AND granted.locktype = 'virtualxid'
-	AND wait.virtualxid = granted.virtualxid )
-	OR
-	( wait.locktype = 'tuple'
-	AND granted.locktype = 'tuple'
-	AND wait.relation = granted.relation
-	AND wait.page = granted.page
-	AND wait.tuple = granted.tuple )
-	)
-LEFT JOIN
-	pg_class c
-ON ( c.relfilenode = wait.relation )
-LEFT JOIN
-	pg_namespace d
-ON ( c.relnamespace = d.oid )
-);
-
 CREATE SCHEMA IF NOT EXISTS pgtools;
 SET search_path = pgtools, public;
 
@@ -654,6 +133,200 @@ BEGIN
     END IF;
 END;
 $d$;
+CREATE SCHEMA IF NOT EXISTS pgtools;
+SET search_path = pgtools, public;
+
+CREATE OR REPLACE VIEW function_stats AS (
+WITH total AS (
+    SELECT SUM(total_time)::BIGINT AS total_agg
+    FROM pg_stat_user_functions
+)
+SELECT
+    schemaname AS schema_name,
+    funcname AS function_name,
+    SUM(calls) AS calls,
+    SUM(total_time)::BIGINT AS total_time,
+    SUM(self_time)::BIGINT AS self_call_time,
+    SUM(total_time)/SUM(calls) AS avg_time,
+    100*SUM(total_time)/(SELECT total_agg FROM total) AS pct_functions
+FROM pg_stat_user_functions
+GROUP BY schema_name, function_name
+ORDER BY total_time DESC
+);
+CREATE SCHEMA IF NOT EXISTS pgtools;
+SET search_path = pgtools, public;
+
+CREATE OR REPLACE VIEW no_stats_table AS (
+  SELECT table_schema, table_name,
+      ( pg_class.relpages = 0 ) AS is_empty,
+      ( psut.relname IS NULL OR ( psut.last_analyze IS NULL and psut.last_autoanalyze IS NULL ) ) AS never_analyzed,
+      array_agg(column_name::TEXT) as no_stats_columns
+  FROM information_schema.columns
+      JOIN pg_class ON columns.table_name = pg_class.relname
+          AND pg_class.relkind = 'r'
+      JOIN pg_namespace ON pg_class.relnamespace = pg_namespace.oid
+          AND nspname = table_schema
+      LEFT OUTER JOIN pg_stats
+      ON table_schema = pg_stats.schemaname
+          AND table_name = pg_stats.tablename
+          AND column_name = pg_stats.attname
+      LEFT OUTER JOIN pg_stat_user_tables AS psut
+          ON table_schema = psut.schemaname
+          AND table_name = psut.relname
+  WHERE pg_stats.attname IS NULL
+      AND table_schema NOT IN ('pg_catalog', 'information_schema')
+  GROUP BY table_schema, table_name, relpages, psut.relname, last_analyze, last_autoanalyze
+);
+CREATE SCHEMA IF NOT EXISTS pgtools;
+SET search_path = pgtools, public;
+
+CREATE OR REPLACE VIEW duplicate_indexes_fuzzy AS (
+WITH index_cols_ord as (
+    SELECT attrelid, attnum, attname
+    FROM pg_attribute
+        JOIN pg_index ON indexrelid = attrelid
+    WHERE indkey[0] > 0
+    ORDER BY attrelid, attnum
+),
+index_col_list AS (
+    SELECT attrelid,
+        array_agg(attname) as cols
+    FROM index_cols_ord
+    GROUP BY attrelid
+),
+dup_natts AS (
+SELECT indrelid, indexrelid
+FROM pg_index as ind
+WHERE EXISTS ( SELECT 1
+    FROM pg_index as ind2
+    WHERE ind.indrelid = ind2.indrelid
+    AND ( ind.indkey @> ind2.indkey
+     OR ind.indkey <@ ind2.indkey )
+    AND ind.indkey[0] = ind2.indkey[0]
+    AND ind.indkey <> ind2.indkey
+    AND ind.indexrelid <> ind2.indexrelid
+) )
+SELECT userdex.schemaname as schema_name,
+    userdex.relname as table_name,
+    userdex.indexrelname as index_name,
+    array_to_string(cols, ', ') as index_cols,
+    indexdef,
+    idx_scan as index_scans
+FROM pg_stat_user_indexes as userdex
+    JOIN index_col_list ON index_col_list.attrelid = userdex.indexrelid
+    JOIN dup_natts ON userdex.indexrelid = dup_natts.indexrelid
+    JOIN pg_indexes ON userdex.schemaname = pg_indexes.schemaname
+        AND userdex.indexrelname = pg_indexes.indexname
+ORDER BY userdex.schemaname, userdex.relname, cols, userdex.indexrelname
+);
+CREATE SCHEMA IF NOT EXISTS pgtools;
+SET search_path = pgtools, public;
+
+CREATE OR REPLACE VIEW query_activity AS (
+  SELECT datid, datname, pid, usesysid, usename, application_name, client_addr, client_hostname, client_port, backend_start, xact_start, query_start, state_change, waiting, state,
+      now() - query_start AS runtime,
+      regexp_replace(query, E'[\n\r\t ]+', ' ', 'ig') AS query
+  FROM pg_stat_activity 
+  WHERE pid <> pg_backend_pid()
+  ORDER BY runtime DESC
+);
+CREATE SCHEMA IF NOT EXISTS pgtools;
+SET search_path = pgtools, public;
+
+CREATE OR REPLACE VIEW lock_check AS (
+SELECT
+	wait.pid,
+	wait.query as q,
+	wait.locktype,
+	granted.pid as waitfor_pid,
+	granted.relation,
+	granted.datname || '.' || d.nspname || '.' || c.relname as name,
+	granted.transactionid,
+	granted.virtualxid,
+	granted.usename,
+	granted.client_addr,
+	granted.query
+FROM
+	(SELECT
+		a.query,
+		b.pid,
+		b.relation,
+		b.transactionid,
+		b.page,
+		b.tuple,
+		b.locktype,
+		b.virtualxid
+	FROM
+		pg_stat_activity a,
+		pg_locks b
+	WHERE
+		a.waiting = 't'
+		AND a.pid = b.pid
+		AND granted = 'f'
+) wait
+INNER JOIN
+	(SELECT
+		b.pid,
+		b.usename,
+		b.client_addr,
+		b.backend_start,
+		b.query_start,
+		b.waiting,
+		b.query,
+		b.datname,
+		a.relation,
+		a.transactionid,
+		a.page,
+		a.tuple,
+		a.locktype,
+		a.virtualxid
+	FROM
+		pg_locks a,
+		pg_stat_activity b
+	WHERE
+		a.pid = b.pid
+		AND a.granted = 't'
+	) granted
+ON (
+	( wait.locktype = 'transactionid'
+	AND granted.locktype = 'transactionid'
+	AND wait.transactionid = granted.transactionid )
+	OR
+	( wait.locktype = 'relation'
+	AND granted.locktype = 'relation'
+	AND wait.relation = granted.relation
+	)
+	OR
+	( wait.locktype = 'virtualxid'
+	AND granted.locktype = 'virtualxid'
+	AND wait.virtualxid = granted.virtualxid )
+	OR
+	( wait.locktype = 'tuple'
+	AND granted.locktype = 'tuple'
+	AND wait.relation = granted.relation
+	AND wait.page = granted.page
+	AND wait.tuple = granted.tuple )
+	)
+LEFT JOIN
+	pg_class c
+ON ( c.relfilenode = wait.relation )
+LEFT JOIN
+	pg_namespace d
+ON ( c.relnamespace = d.oid )
+);
+
+CREATE SCHEMA IF NOT EXISTS pgtools;
+SET search_path = pgtools, public;
+
+CREATE OR REPLACE VIEW query_statements AS (
+  SELECT calls,
+      (total_time / 1000) AS total_time,
+      (total_time/calls / 1000) AS avg_time,
+      regexp_replace(query, E'[\n\r\t ]+', ' ', 'ig') AS query
+  FROM pg_stat_statements
+  WHERE query <> ALL (ARRAY['SELECT $1;'::text, 'BEGIN'::text, 'COMMIT'::text, 'ROLLBACK'::text, 'DISCARD ALL;'::text]) AND query !~* 'vacuum' AND query !~* 'analyze' AND query !~* 'create index'
+  ORDER BY avg_time desc
+);
 CREATE SCHEMA IF NOT EXISTS pgtools;
 SET search_path = pgtools, public;
 
@@ -792,26 +465,508 @@ $f$;
 CREATE SCHEMA IF NOT EXISTS pgtools;
 SET search_path = pgtools, public;
 
-CREATE OR REPLACE VIEW no_stats_table AS (
-  SELECT table_schema, table_name,
-      ( pg_class.relpages = 0 ) AS is_empty,
-      ( psut.relname IS NULL OR ( psut.last_analyze IS NULL and psut.last_autoanalyze IS NULL ) ) AS never_analyzed,
-      array_agg(column_name::TEXT) as no_stats_columns
-  FROM information_schema.columns
-      JOIN pg_class ON columns.table_name = pg_class.relname
-          AND pg_class.relkind = 'r'
-      JOIN pg_namespace ON pg_class.relnamespace = pg_namespace.oid
-          AND nspname = table_schema
-      LEFT OUTER JOIN pg_stats
-      ON table_schema = pg_stats.schemaname
-          AND table_name = pg_stats.tablename
-          AND column_name = pg_stats.attname
-      LEFT OUTER JOIN pg_stat_user_tables AS psut
-          ON table_schema = psut.schemaname
-          AND table_name = psut.relname
-  WHERE pg_stats.attname IS NULL
-      AND table_schema NOT IN ('pg_catalog', 'information_schema')
-  GROUP BY table_schema, table_name, relpages, psut.relname, last_analyze, last_autoanalyze
+CREATE OR REPLACE VIEW top_query AS (
+  SELECT datname, pid, usesysid, usename, application_name, client_addr, client_port, waiting, state,
+      now() - query_start AS runtime,
+      regexp_replace(query, E'[\n\r\t ]+', ' ', 'ig') AS query
+  FROM pg_stat_activity 
+  WHERE pid <> pg_backend_pid() AND state <> 'idle'
+  ORDER BY runtime DESC
+);
+CREATE SCHEMA IF NOT EXISTS pgtools;
+SET search_path = pgtools, public;
+
+--html decode funtion
+CREATE OR REPLACE FUNCTION strip_tags(TEXT)
+RETURNS TEXT
+AS $$
+    SELECT regexp_replace(regexp_replace($1, E'(?x)<[^>]*?(\s alt \s* = \s* ([\'"]) ([^>]*?) \2) [^>]*? >', E'\3'), E'(?x)(< [^>]*? >)', '', 'g');
+$$
+LANGUAGE SQL;
+CREATE SCHEMA IF NOT EXISTS pgtools;
+SET search_path = pgtools, public;
+
+-- btree index stats query
+-- estimates bloat for btree indexes
+CREATE OR REPLACE VIEW bloat_indexes AS (
+WITH btree_index_atts AS (
+    SELECT nspname, 
+        indexclass.relname as index_name, 
+        indexclass.reltuples, 
+        indexclass.relpages, 
+        indrelid, indexrelid,
+        indexclass.relam,
+        tableclass.relname as tablename,
+        regexp_split_to_table(indkey::text, ' ')::smallint AS attnum,
+        indexrelid as index_oid
+    FROM pg_index
+    JOIN pg_class AS indexclass ON pg_index.indexrelid = indexclass.oid
+    JOIN pg_class AS tableclass ON pg_index.indrelid = tableclass.oid
+    JOIN pg_namespace ON pg_namespace.oid = indexclass.relnamespace
+    JOIN pg_am ON indexclass.relam = pg_am.oid
+    WHERE pg_am.amname = 'btree' and indexclass.relpages > 0
+         --AND nspname NOT IN ('pg_catalog','information_schema')
+    ),
+index_item_sizes AS (
+    SELECT
+    ind_atts.nspname, ind_atts.index_name, 
+    ind_atts.reltuples, ind_atts.relpages, ind_atts.relam,
+    indrelid AS table_oid, index_oid,
+    current_setting('block_size')::numeric AS bs,
+    8 AS maxalign,
+    24 AS pagehdr,
+    CASE WHEN max(coalesce(pg_stats.null_frac,0)) = 0
+        THEN 2
+        ELSE 6
+    END AS index_tuple_hdr,
+    sum( (1-coalesce(pg_stats.null_frac, 0)) * coalesce(pg_stats.avg_width, 1024) ) AS nulldatawidth
+    FROM pg_attribute
+    JOIN btree_index_atts AS ind_atts ON pg_attribute.attrelid = ind_atts.indexrelid -- AND pg_attribute.attnum = ind_atts.attnum
+    JOIN pg_stats ON pg_stats.schemaname = ind_atts.nspname
+          -- stats for regular index columns
+          AND ( (pg_stats.tablename = ind_atts.tablename AND pg_stats.attname = pg_catalog.pg_get_indexdef(pg_attribute.attrelid, pg_attribute.attnum, TRUE)) 
+          -- stats for functional indexes
+          OR   (pg_stats.tablename = ind_atts.index_name AND pg_stats.attname = pg_attribute.attname))
+    WHERE pg_attribute.attnum > 0
+    GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9
+),
+index_aligned_est AS (
+    SELECT maxalign, bs, nspname, index_name, reltuples,
+        relpages, relam, table_oid, index_oid,
+        coalesce (
+            ceil (
+                reltuples * ( 6 
+                    + maxalign 
+                    - CASE
+                        WHEN index_tuple_hdr%maxalign = 0 THEN maxalign
+                        ELSE index_tuple_hdr%maxalign
+                      END
+                    + nulldatawidth 
+                    + maxalign 
+                    - CASE /* Add padding to the data to align on MAXALIGN */
+                        WHEN nulldatawidth::integer%maxalign = 0 THEN maxalign
+                        ELSE nulldatawidth::integer%maxalign
+                      END
+                )::numeric 
+              / ( bs - pagehdr::NUMERIC )
+              +1 )
+         , 0 )
+      as expected
+    FROM index_item_sizes
+),
+raw_bloat AS (
+    SELECT current_database() as dbname, nspname, pg_class.relname AS table_name, index_name,
+        bs*(index_aligned_est.relpages)::bigint AS totalbytes, expected,
+        CASE
+            WHEN index_aligned_est.relpages <= expected 
+                THEN 0
+                ELSE bs*(index_aligned_est.relpages-expected)::bigint 
+            END AS wastedbytes,
+        CASE
+            WHEN index_aligned_est.relpages <= expected
+                THEN 0 
+                ELSE bs*(index_aligned_est.relpages-expected)::bigint * 100 / (bs*(index_aligned_est.relpages)::bigint) 
+            END AS realbloat,
+        pg_relation_size(index_aligned_est.table_oid) as table_bytes,
+        stat.idx_scan as index_scans
+    FROM index_aligned_est
+    JOIN pg_class ON pg_class.oid=index_aligned_est.table_oid
+    JOIN pg_stat_user_indexes AS stat ON index_aligned_est.index_oid = stat.indexrelid
+),
+format_bloat AS (
+SELECT dbname as database_name, nspname as schema_name, table_name, index_name,
+        round(realbloat) as bloat_pct, round(wastedbytes/(1024^2)::NUMERIC) as bloat_mb,
+        round(totalbytes/(1024^2)::NUMERIC,3) as index_mb,
+        round(table_bytes/(1024^2)::NUMERIC,3) as table_mb,
+        index_scans
+FROM raw_bloat
+)
+-- final query outputting the bloated indexes
+SELECT database_name, schema_name, table_name, index_name, index_scans, bloat_pct, bloat_mb, index_mb, table_mb
+FROM format_bloat
+ORDER BY bloat_mb, bloat_pct DESC 
+);
+CREATE SCHEMA IF NOT EXISTS pgtools;
+SET search_path = pgtools, public;
+
+WITH table_scans as (
+    SELECT relid,
+        tables.idx_scan + tables.seq_scan as all_scans,
+        ( tables.n_tup_ins + tables.n_tup_upd + tables.n_tup_del ) as writes,
+                pg_relation_size(relid) as table_size
+        FROM pg_stat_user_tables as tables
+),
+all_writes as (
+    SELECT sum(writes) as total_writes
+    FROM table_scans
+),
+indexes as (
+    SELECT idx_stat.relid, idx_stat.indexrelid,
+        idx_stat.schemaname, idx_stat.relname as tablename,
+        idx_stat.indexrelname as indexname,
+        idx_stat.idx_scan,
+        pg_relation_size(idx_stat.indexrelid) as index_bytes,
+        indexdef ~* 'USING btree' AS idx_is_btree
+    FROM pg_stat_user_indexes as idx_stat
+        JOIN pg_index
+            USING (indexrelid)
+        JOIN pg_indexes as indexes
+            ON idx_stat.schemaname = indexes.schemaname
+                AND idx_stat.relname = indexes.tablename
+                AND idx_stat.indexrelname = indexes.indexname
+    WHERE pg_index.indisunique = FALSE
+),
+index_ratios AS (
+SELECT schemaname, tablename, indexname,
+    idx_scan, all_scans,
+    round(( CASE WHEN all_scans = 0 THEN 0.0::NUMERIC
+        ELSE idx_scan::NUMERIC/all_scans * 100 END),2) as index_scan_pct,
+    writes,
+    round((CASE WHEN writes = 0 THEN idx_scan::NUMERIC ELSE idx_scan::NUMERIC/writes END),2)
+        as scans_per_write,
+    pg_size_pretty(index_bytes) as index_size,
+    pg_size_pretty(table_size) as table_size,
+    idx_is_btree, index_bytes
+    FROM indexes
+    JOIN table_scans
+    USING (relid)
+),
+index_groups AS (
+SELECT 'Never Used Indexes' as reason, *, 1 as grp
+FROM index_ratios
+WHERE
+    idx_scan = 0
+    and idx_is_btree
+UNION ALL
+SELECT 'Low Scans, High Writes' as reason, *, 2 as grp
+FROM index_ratios
+WHERE
+    scans_per_write <= 1
+    and index_scan_pct < 10
+    and idx_scan > 0
+    and writes > 100
+    and idx_is_btree
+UNION ALL
+SELECT 'Seldom Used Large Indexes' as reason, *, 3 as grp
+FROM index_ratios
+WHERE
+    index_scan_pct < 5
+    and scans_per_write > 1
+    and idx_scan > 0
+    and idx_is_btree
+    and index_bytes > 100000000
+UNION ALL
+SELECT 'High-Write Large Non-Btree' as reason, index_ratios.*, 4 as grp 
+FROM index_ratios, all_writes
+WHERE
+    ( writes::NUMERIC / ( total_writes + 1 ) ) > 0.02
+    AND NOT idx_is_btree
+    AND index_bytes > 100000000
+ORDER BY grp, index_bytes DESC )
+SELECT reason, schemaname, tablename, indexname,
+    index_scan_pct, scans_per_write, index_size, table_size
+FROM index_groups;
+CREATE SCHEMA IF NOT EXISTS pgtools;
+SET search_path = pgtools, public;
+
+CREATE OR REPLACE VIEW vacuum_needed AS (
+  SELECT av.nspname AS schema_name, av.relname AS table_name, av.n_tup_ins, av.n_tup_upd, av.n_tup_del,
+      av.hot_update_ratio, av.n_live_tup, av.n_dead_tup, av.reltuples,
+      av.athreshold, av.last_vacuum, av.last_analyze,
+      av.n_dead_tup::double precision > av.athreshold AS aneeded,
+      CASE
+          WHEN av.reltuples > 0::double precision THEN round((100.0 * av.n_dead_tup::numeric)::double precision / av.reltuples)
+          ELSE 0::double precision
+      END AS pct_dead
+  FROM ( SELECT n.nspname, c.relname,
+              pg_stat_get_tuples_inserted(c.oid) AS n_tup_ins,
+              pg_stat_get_tuples_updated(c.oid) AS n_tup_upd,
+              pg_stat_get_tuples_deleted(c.oid) AS n_tup_del,
+              CASE
+                  WHEN pg_stat_get_tuples_updated(c.oid) > 0 THEN pg_stat_get_tuples_hot_updated(c.oid)::real / pg_stat_get_tuples_updated(c.oid)::double precision
+                  ELSE 0::double precision
+              END AS hot_update_ratio,
+              pg_stat_get_live_tuples(c.oid) AS n_live_tup,
+              pg_stat_get_dead_tuples(c.oid) AS n_dead_tup, c.reltuples,
+              round(current_setting('autovacuum_vacuum_threshold'::text)::integer::double precision + current_setting('autovacuum_vacuum_scale_factor'::text)::numeric::double precision * c.reltuples) AS athreshold,
+              date_trunc('minute'::text, GREATEST(pg_stat_get_last_vacuum_time(c.oid), pg_stat_get_last_autovacuum_time(c.oid))) AS last_vacuum,
+              date_trunc('minute'::text, GREATEST(pg_stat_get_last_analyze_time(c.oid), pg_stat_get_last_analyze_time(c.oid))) AS last_analyze
+          FROM pg_class c
+          LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE (c.relkind = ANY (ARRAY['r'::"char", 't'::"char"])) AND n.nspname !~ '^pg_toast'::text
+      ) av
+  ORDER BY av.n_dead_tup::double precision > av.athreshold DESC, av.n_dead_tup DESC
+);
+CREATE SCHEMA IF NOT EXISTS pgtools;
+SET search_path = pgtools, public;
+
+-- new table bloat query
+-- still needs work; is often off by +/- 20%
+CREATE OR REPLACE VIEW bloat_tables AS (
+WITH constants AS (
+    SELECT current_setting('block_size')::numeric AS bs, 23 AS hdr, 8 AS ma
+),
+no_stats AS (
+    SELECT table_schema, table_name, 
+        n_live_tup::numeric as est_rows,
+        pg_table_size(relid)::numeric as table_size
+    FROM information_schema.columns
+        JOIN pg_stat_user_tables as psut
+           ON table_schema = psut.schemaname
+           AND table_name = psut.relname
+        LEFT OUTER JOIN pg_stats
+        ON table_schema = pg_stats.schemaname
+            AND table_name = pg_stats.tablename
+            AND column_name = attname 
+    WHERE attname IS NULL
+        AND table_schema NOT IN ('pg_catalog', 'information_schema')
+    GROUP BY table_schema, table_name, relid, n_live_tup
+),
+null_headers AS (
+    -- calculate null header sizes
+    -- omitting tables which dont have complete stats
+    -- and attributes which aren't visible
+    SELECT
+        hdr+1+(sum(CASE WHEN null_frac <> 0 THEN 1 else 0 END)/8) as nullhdr,
+        SUM((1-null_frac)*avg_width) as datawidth,
+        MAX(null_frac) as maxfracsum,
+        schemaname,
+        tablename,
+        hdr, ma, bs
+    FROM pg_stats CROSS JOIN constants
+        LEFT OUTER JOIN no_stats
+            ON schemaname = no_stats.table_schema
+            AND tablename = no_stats.table_name
+    WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+        AND no_stats.table_name IS NULL
+        AND EXISTS ( SELECT 1
+            FROM information_schema.columns
+                WHERE schemaname = columns.table_schema
+                    AND tablename = columns.table_name )
+    GROUP BY schemaname, tablename, hdr, ma, bs
+),
+data_headers AS (
+    -- estimate header and row size
+    SELECT
+        ma, bs, hdr, schemaname, tablename,
+        (datawidth+(hdr+ma-(CASE WHEN hdr%ma=0 THEN ma ELSE hdr%ma END)))::numeric AS datahdr,
+        (maxfracsum*(nullhdr+ma-(CASE WHEN nullhdr%ma=0 THEN ma ELSE nullhdr%ma END))) AS nullhdr2
+    FROM null_headers
+),
+table_estimates AS (
+    -- make estimates of how large the table should be
+    -- based on row and page size
+    SELECT schemaname, tablename, bs,
+        reltuples::numeric as est_rows, relpages * bs as table_bytes,
+    CEIL((reltuples*
+            (datahdr + nullhdr2 + 4 + ma -
+                (CASE WHEN datahdr%ma=0
+                    THEN ma ELSE datahdr%ma END)
+                )/(bs-20))) * bs AS expected_bytes,
+        reltoastrelid
+    FROM data_headers
+        JOIN pg_class ON tablename = relname
+        JOIN pg_namespace ON relnamespace = pg_namespace.oid
+            AND schemaname = nspname
+    WHERE pg_class.relkind = 'r'
+),
+estimates_with_toast AS (
+    -- add in estimated TOAST table sizes
+    -- estimate based on 4 toast tuples per page because we dont have 
+    -- anything better.  also append the no_data tables
+    SELECT schemaname, tablename, 
+        TRUE as can_estimate,
+        est_rows,
+        table_bytes + ( coalesce(toast.relpages, 0) * bs ) as table_bytes,
+        expected_bytes + ( ceil( coalesce(toast.reltuples, 0) / 4 ) * bs ) as expected_bytes
+    FROM table_estimates LEFT OUTER JOIN pg_class as toast
+        ON table_estimates.reltoastrelid = toast.oid
+            AND toast.relkind = 't'
+),
+table_estimates_plus AS (
+-- add some extra metadata to the table data
+-- and calculations to be reused
+-- including whether we cant estimate it
+-- or whether we think it might be compressed
+    SELECT current_database() as databasename,
+            schemaname, tablename, can_estimate, 
+            est_rows,
+            CASE
+                WHEN table_bytes > 0
+                THEN table_bytes::NUMERIC
+                ELSE NULL::NUMERIC 
+            END AS table_bytes,
+            CASE
+                WHEN expected_bytes > 0 
+                THEN expected_bytes::NUMERIC
+                ELSE NULL::NUMERIC 
+            END AS expected_bytes,
+            CASE
+                WHEN expected_bytes > 0 AND table_bytes > 0
+                    AND expected_bytes <= table_bytes
+                THEN (table_bytes - expected_bytes)::NUMERIC
+                ELSE 0::NUMERIC
+            END AS bloat_bytes
+    FROM estimates_with_toast
+    UNION ALL
+    SELECT current_database() as databasename, 
+        table_schema, table_name, FALSE, 
+        est_rows, table_size,
+        NULL::NUMERIC, NULL::NUMERIC
+    FROM no_stats
+),
+bloat_data AS (
+    -- do final math calculations and formatting
+    select current_database() as database_name,
+        schemaname as schema_name, tablename as table_name, can_estimate, 
+        table_bytes, round(table_bytes/(1024^2)::NUMERIC,3) as table_mb,
+        expected_bytes, round(expected_bytes/(1024^2)::NUMERIC,3) as expected_mb,
+        round(bloat_bytes*100/table_bytes) as bloat_pct,
+        round(bloat_bytes/(1024::NUMERIC^2),2) as bloat_mb,
+        est_rows
+    FROM table_estimates_plus
+)
+SELECT database_name, schema_name, table_name, bloat_pct, bloat_mb, table_mb, can_estimate, est_rows
+FROM bloat_data
+ORDER BY bloat_mb, bloat_pct DESC
+);
+CREATE SCHEMA IF NOT EXISTS pgtools;
+SET search_path = pgtools, public;
+
+CREATE OR REPLACE VIEW backend_queries AS (
+SELECT pg_stat_get_backend_pid(s.backendid) AS pid,
+    pg_stat_get_backend_client_addr(s.backendid) AS client_addr,
+    pg_stat_get_backend_client_port(s.backendid) AS client_port,
+    pg_stat_get_backend_start(s.backendid) AS session_start_time,
+    pg_stat_get_backend_xact_start(s.backendid) AS transaction_start_time,
+    now() - pg_stat_get_backend_xact_start(s.backendid) AS transaction_time,
+    pg_stat_get_backend_waiting(s.backendid) AS is_waiting,
+    regexp_replace(pg_stat_get_backend_activity(s.backendid), E'[\n\r\t ]+', ' ', 'ig') AS query
+FROM ( SELECT pg_stat_get_backend_idset() AS backendid) s
+WHERE regexp_replace(pg_stat_get_backend_activity(s.backendid), E'[\n\r\t ]+', ' ', 'ig') <> ALL (ARRAY['select 1'::text, 'SELECT $1;'::text, 'BEGIN'::text, 'COMMIT'::text, 'ROLLBACK'::text, 'DISCARD ALL;'::text, 'DEALLOCATE ALL;'::text, 'SHOW TRANSACTION ISOLATION LEVEL'::text, 'SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE'::text])
+ORDER BY transaction_time DESC
+);
+CREATE SCHEMA IF NOT EXISTS pgtools;
+SET search_path = pgtools, public;
+
+CREATE OR REPLACE VIEW fk_no_index AS (
+WITH fk_actions ( code, action ) AS (
+    VALUES ( 'a', 'error' ),
+        ( 'r', 'restrict' ),
+        ( 'c', 'cascade' ),
+        ( 'n', 'set null' ),
+        ( 'd', 'set default' )
+),
+fk_list AS (
+    SELECT pg_constraint.oid as fkoid, conrelid, confrelid as parentid,
+        conname, relname, nspname,
+        fk_actions_update.action as update_action,
+        fk_actions_delete.action as delete_action,
+        conkey as key_cols
+    FROM pg_constraint
+        JOIN pg_class ON conrelid = pg_class.oid
+        JOIN pg_namespace ON pg_class.relnamespace = pg_namespace.oid
+        JOIN fk_actions AS fk_actions_update ON confupdtype = fk_actions_update.code
+        JOIN fk_actions AS fk_actions_delete ON confdeltype = fk_actions_delete.code
+    WHERE contype = 'f'
+),
+fk_attributes AS (
+    SELECT fkoid, conrelid, attname, attnum
+    FROM fk_list
+        JOIN pg_attribute
+            ON conrelid = attrelid
+            AND attnum = ANY( key_cols )
+    ORDER BY fkoid, attnum
+),
+fk_cols_list AS (
+    SELECT fkoid, array_agg(attname) as cols_list
+    FROM fk_attributes
+    GROUP BY fkoid
+),
+index_list AS (
+    SELECT indexrelid as indexid,
+        pg_class.relname as indexname,
+        indrelid,
+        indkey,
+        indpred is not null as has_predicate,
+        pg_get_indexdef(indexrelid) as indexdef
+    FROM pg_index
+        JOIN pg_class ON indexrelid = pg_class.oid
+    WHERE indisvalid
+),
+fk_index_match AS (
+    SELECT fk_list.*,
+        indexid,
+        indexname,
+        indkey::int[] as indexatts,
+        has_predicate,
+        indexdef,
+        array_length(key_cols, 1) as fk_colcount,
+        array_length(indkey,1) as index_colcount,
+        round(pg_relation_size(conrelid)/(1024^2)::numeric) as table_mb,
+        cols_list
+    FROM fk_list
+        JOIN fk_cols_list USING (fkoid)
+        LEFT OUTER JOIN index_list
+            ON conrelid = indrelid
+            AND (indkey::int2[])[0:(array_length(key_cols,1) -1)] @> key_cols
+
+),
+fk_perfect_match AS (
+    SELECT fkoid
+    FROM fk_index_match
+    WHERE (index_colcount - 1) <= fk_colcount
+        AND NOT has_predicate
+        AND indexdef LIKE '%USING btree%'
+),
+fk_index_check AS (
+    SELECT 'no index' as issue, *, 1 as issue_sort
+    FROM fk_index_match
+    WHERE indexid IS NULL
+    UNION ALL
+    SELECT 'questionable index' as issue, *, 2
+    FROM fk_index_match
+    WHERE indexid IS NOT NULL
+        AND fkoid NOT IN (
+            SELECT fkoid
+            FROM fk_perfect_match)
+),
+parent_table_stats AS (
+    SELECT fkoid, tabstats.relname as parent_name,
+        (n_tup_ins + n_tup_upd + n_tup_del + n_tup_hot_upd) as parent_writes,
+        round(pg_relation_size(parentid)/(1024^2)::numeric) as parent_mb
+    FROM pg_stat_user_tables AS tabstats
+        JOIN fk_list
+            ON relid = parentid
+),
+fk_table_stats AS (
+    SELECT fkoid,
+        (n_tup_ins + n_tup_upd + n_tup_del + n_tup_hot_upd) as writes,
+        seq_scan as table_scans
+    FROM pg_stat_user_tables AS tabstats
+        JOIN fk_list
+            ON relid = conrelid
+)
+SELECT nspname as schema_name,
+    relname as table_name,
+    conname as fk_name,
+    issue,
+    table_mb,
+    writes,
+    table_scans,
+    parent_name,
+    parent_mb,
+    parent_writes,
+    cols_list,
+    indexdef
+FROM fk_index_check
+    JOIN parent_table_stats USING (fkoid)
+    JOIN fk_table_stats USING (fkoid)
+WHERE table_mb > 9
+    AND ( writes > 1000
+        OR parent_writes > 1000
+        OR parent_mb > 10 )
+ORDER BY issue_sort, table_mb DESC, table_name, fk_name
 );
 CREATE SCHEMA IF NOT EXISTS pgtools;
 SET search_path = pgtools, public;
@@ -829,25 +984,55 @@ CREATE OR REPLACE VIEW pgstat_io AS (
 CREATE SCHEMA IF NOT EXISTS pgtools;
 SET search_path = pgtools, public;
 
-CREATE OR REPLACE VIEW query_activity AS (
-  SELECT datid, datname, pid, usesysid, usename, application_name, client_addr, client_hostname, client_port, backend_start, xact_start, query_start, state_change, waiting, state,
-      now() - query_start AS runtime,
-      regexp_replace(query, E'[\n\r\t ]+', ' ', 'ig') AS query
-  FROM pg_stat_activity 
-  WHERE pid <> pg_backend_pid()
-  ORDER BY runtime DESC
-);
+--url decode function
+CREATE OR REPLACE FUNCTION url_decode(encode_url text)
+RETURNS text
+IMMUTABLE STRICT AS $$
+DECLARE
+    bin bytea = '';
+    byte text;
+BEGIN
+    FOR byte IN (select (regexp_matches(encode_url, '(%..|.)', 'g'))[1]) LOOP
+        IF length(byte) = 3 THEN
+            bin = bin || decode(substring(byte, 2, 2), 'hex');
+        ELSE
+            bin = bin || byte::bytea;
+        END IF;
+    END LOOP;
+RETURN convert_from(bin, 'utf8');
+END
+$$
+LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION decode_url(encode_url character varying) 
+RETURNS character varying 
+IMMUTABLE STRICT AS $$ 
+    select convert_from(CasT(E'\\x' || string_agg(CasE WHEN length(r.m[1]) = 1 THEN encode(convert_to(r.m[1], 'SQL_asCII'), 'hex') ELSE substring(r.m[1] from 2 for 2) END, '') as bytea), 'UTF8') 
+        from regexp_matches($1, '%[0-9a-f][0-9a-f]|.', 'gi') as r(m); 
+$$ 
+LANGUAGE SQL; 
 CREATE SCHEMA IF NOT EXISTS pgtools;
 SET search_path = pgtools, public;
 
-CREATE OR REPLACE VIEW query_statements AS (
-  SELECT calls,
-      (total_time / 1000) AS total_time,
-      (total_time/calls / 1000) AS avg_time,
-      regexp_replace(query, E'[\n\r\t ]+', ' ', 'ig') AS query
-  FROM pg_stat_statements
-  WHERE query <> ALL (ARRAY['SELECT $1;'::text, 'BEGIN'::text, 'COMMIT'::text, 'ROLLBACK'::text, 'DISCARD ALL;'::text]) AND query !~* 'vacuum' AND query !~* 'analyze' AND query !~* 'create index'
-  ORDER BY avg_time desc
+CREATE OR REPLACE VIEW repeated_indexes AS (
+  SELECT key,
+      indexrelid AS idx_oid,
+      schemaname AS schema_name,
+      tablename AS table_name,
+      indexname AS idx_name,
+      indisprimary,
+      idx_scan, idx_tup_read, idx_tup_fetch,
+      idx_size
+  FROM (
+      SELECT pi.indexrelid, pi.indisprimary, pis.schemaname, pis.tablename, pis.indexname, psui.idx_scan, psui.idx_tup_read, psui.idx_tup_fetch,
+          pg_size_pretty(pg_relation_size(pi.indexrelid)) AS idx_size,
+          pi.indrelid::text || pi.indclass::text || pi.indkey::text || COALESCE(pi.indexprs::text, '') || COALESCE(pi.indpred::text, '') AS key,
+          count(*) OVER (PARTITION BY pi.indrelid::text || pi.indclass::text || pi.indkey::text || COALESCE(pi.indexprs::text, '') || COALESCE(pi.indpred::text, '')) AS n_rpt_idx
+      FROM pg_index pi, pg_indexes pis, pg_stat_user_indexes psui
+      WHERE pi.indexrelid::regclass::text = pis.indexname AND pi.indexrelid = psui.indexrelid AND pis.schemaname NOT IN ('pg_catalog', 'information_schema') 
+  ) sub
+  WHERE n_rpt_idx > 1
+  ORDER BY idx_size DESC
 );
 CREATE SCHEMA IF NOT EXISTS pgtools;
 SET search_path = pgtools, public;
@@ -883,29 +1068,6 @@ CREATE OR REPLACE VIEW relation_size AS (
 CREATE SCHEMA IF NOT EXISTS pgtools;
 SET search_path = pgtools, public;
 
-CREATE OR REPLACE VIEW repeated_indexes AS (
-  SELECT key,
-      indexrelid AS idx_oid,
-      schemaname AS schema_name,
-      tablename AS table_name,
-      indexname AS idx_name,
-      indisprimary,
-      idx_scan, idx_tup_read, idx_tup_fetch,
-      idx_size
-  FROM (
-      SELECT pi.indexrelid, pi.indisprimary, pis.schemaname, pis.tablename, pis.indexname, psui.idx_scan, psui.idx_tup_read, psui.idx_tup_fetch,
-          pg_size_pretty(pg_relation_size(pi.indexrelid)) AS idx_size,
-          pi.indrelid::text || pi.indclass::text || pi.indkey::text || COALESCE(pi.indexprs::text, '') || COALESCE(pi.indpred::text, '') AS key,
-          count(*) OVER (PARTITION BY pi.indrelid::text || pi.indclass::text || pi.indkey::text || COALESCE(pi.indexprs::text, '') || COALESCE(pi.indpred::text, '')) AS n_rpt_idx
-      FROM pg_index pi, pg_indexes pis, pg_stat_user_indexes psui
-      WHERE pi.indexrelid::regclass::text = pis.indexname AND pi.indexrelid = psui.indexrelid AND pis.schemaname NOT IN ('pg_catalog', 'information_schema') 
-  ) sub
-  WHERE n_rpt_idx > 1
-  ORDER BY idx_size DESC
-);
-CREATE SCHEMA IF NOT EXISTS pgtools;
-SET search_path = pgtools, public;
-
 CREATE OR REPLACE FUNCTION pg_stat_repl()
 RETURNS SETOF pg_catalog.pg_stat_replication
 AS $$
@@ -935,86 +1097,4 @@ SELECT
         WHEN (pg_last_xlog_receive_location() = pg_last_xlog_replay_location()) THEN (0)::double precision
         ELSE date_part('epoch'::text, (now() - pg_last_xact_replay_timestamp()))
     END AS time_delay
-);
-CREATE SCHEMA IF NOT EXISTS pgtools;
-SET search_path = pgtools, public;
-
---html decode funtion
-CREATE OR REPLACE FUNCTION strip_tags(TEXT)
-RETURNS TEXT
-AS $$
-    SELECT regexp_replace(regexp_replace($1, E'(?x)<[^>]*?(\s alt \s* = \s* ([\'"]) ([^>]*?) \2) [^>]*? >', E'\3'), E'(?x)(< [^>]*? >)', '', 'g');
-$$
-LANGUAGE SQL;
-CREATE SCHEMA IF NOT EXISTS pgtools;
-SET search_path = pgtools, public;
-
-CREATE OR REPLACE VIEW top_query AS (
-  SELECT datname, pid, usesysid, usename, application_name, client_addr, client_port, waiting, state,
-      now() - query_start AS runtime,
-      regexp_replace(query, E'[\n\r\t ]+', ' ', 'ig') AS query
-  FROM pg_stat_activity 
-  WHERE pid <> pg_backend_pid() AND state <> 'idle'
-  ORDER BY runtime DESC
-);
-CREATE SCHEMA IF NOT EXISTS pgtools;
-SET search_path = pgtools, public;
-
---url decode function
-CREATE OR REPLACE FUNCTION url_decode(encode_url text)
-RETURNS text
-IMMUTABLE STRICT AS $$
-DECLARE
-    bin bytea = '';
-    byte text;
-BEGIN
-    FOR byte IN (select (regexp_matches(encode_url, '(%..|.)', 'g'))[1]) LOOP
-        IF length(byte) = 3 THEN
-            bin = bin || decode(substring(byte, 2, 2), 'hex');
-        ELSE
-            bin = bin || byte::bytea;
-        END IF;
-    END LOOP;
-RETURN convert_from(bin, 'utf8');
-END
-$$
-LANGUAGE plpgsql;
-
-CREATE OR REPLACE FUNCTION decode_url(encode_url character varying) 
-RETURNS character varying 
-IMMUTABLE STRICT AS $$ 
-    select convert_from(CasT(E'\\x' || string_agg(CasE WHEN length(r.m[1]) = 1 THEN encode(convert_to(r.m[1], 'SQL_asCII'), 'hex') ELSE substring(r.m[1] from 2 for 2) END, '') as bytea), 'UTF8') 
-        from regexp_matches($1, '%[0-9a-f][0-9a-f]|.', 'gi') as r(m); 
-$$ 
-LANGUAGE SQL; 
-CREATE SCHEMA IF NOT EXISTS pgtools;
-SET search_path = pgtools, public;
-
-CREATE OR REPLACE VIEW vacuum_needed AS (
-  SELECT av.nspname AS schema_name, av.relname AS table_name, av.n_tup_ins, av.n_tup_upd, av.n_tup_del,
-      av.hot_update_ratio, av.n_live_tup, av.n_dead_tup, av.reltuples,
-      av.athreshold, av.last_vacuum, av.last_analyze,
-      av.n_dead_tup::double precision > av.athreshold AS aneeded,
-      CASE
-          WHEN av.reltuples > 0::double precision THEN round((100.0 * av.n_dead_tup::numeric)::double precision / av.reltuples)
-          ELSE 0::double precision
-      END AS pct_dead
-  FROM ( SELECT n.nspname, c.relname,
-              pg_stat_get_tuples_inserted(c.oid) AS n_tup_ins,
-              pg_stat_get_tuples_updated(c.oid) AS n_tup_upd,
-              pg_stat_get_tuples_deleted(c.oid) AS n_tup_del,
-              CASE
-                  WHEN pg_stat_get_tuples_updated(c.oid) > 0 THEN pg_stat_get_tuples_hot_updated(c.oid)::real / pg_stat_get_tuples_updated(c.oid)::double precision
-                  ELSE 0::double precision
-              END AS hot_update_ratio,
-              pg_stat_get_live_tuples(c.oid) AS n_live_tup,
-              pg_stat_get_dead_tuples(c.oid) AS n_dead_tup, c.reltuples,
-              round(current_setting('autovacuum_vacuum_threshold'::text)::integer::double precision + current_setting('autovacuum_vacuum_scale_factor'::text)::numeric::double precision * c.reltuples) AS athreshold,
-              date_trunc('minute'::text, GREATEST(pg_stat_get_last_vacuum_time(c.oid), pg_stat_get_last_autovacuum_time(c.oid))) AS last_vacuum,
-              date_trunc('minute'::text, GREATEST(pg_stat_get_last_analyze_time(c.oid), pg_stat_get_last_analyze_time(c.oid))) AS last_analyze
-          FROM pg_class c
-          LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
-          WHERE (c.relkind = ANY (ARRAY['r'::"char", 't'::"char"])) AND n.nspname !~ '^pg_toast'::text
-      ) av
-  ORDER BY av.n_dead_tup::double precision > av.athreshold DESC, av.n_dead_tup DESC
 );
